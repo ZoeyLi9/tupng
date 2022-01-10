@@ -2,6 +2,8 @@ package main
 
 import (
 	"github.com/golang/glog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"tupng/id"
@@ -16,7 +18,30 @@ var (
 
 )
 
-//获取文件路径
+//获取文件路径，将其存入channel
+func getFile(root string) (value chan string, err chan error) {
+	err = make(chan error, 1)
+	value = make(chan string)
+	//开一个goroutine遍历根目录文件
+	go func() {
+		//记得结束后关闭channel
+		defer close(value)
+		//遍历根目录
+		err <- filepath.Walk(root, func(path string, info os.FileInfo, err error) error { //函数作为参数，嵌套使用函数
+			if err != nil {
+				return err
+			}
+			//判断文件信息是否合法，若不合法，返回空，即不记录其path
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+			//将path的值传给value
+			value <- path
+			return nil
+		})
+	}()
+	return
+}
 
 //接收文件并将其发送到channel中处理
 
@@ -53,5 +78,4 @@ func getName(name string) string {
 		return v1
 	}
 	return ""
-
 }
