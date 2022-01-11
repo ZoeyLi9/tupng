@@ -1,12 +1,23 @@
 package main
 
 import (
+	"flag"
+	"fmt"
 	"github.com/golang/glog"
+	"github.com/nfnt/resize"
+	"image"
+	"image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"tupng/id"
+	"tupng/memo"
 )
 
 var (
@@ -18,8 +29,14 @@ var (
 
 )
 
+//定义图片临时处理的结构体
+type P struct {
+	img  image.Image
+	name string
+}
+
 //获取文件路径，将其存入channel
-func getFile(root string) (value chan string, err chan error) {
+func getFilePath(root string) (value chan string, err chan error) {
 	err = make(chan error, 1)
 	value = make(chan string)
 	//开一个goroutine遍历根目录文件
@@ -44,6 +61,154 @@ func getFile(root string) (value chan string, err chan error) {
 }
 
 //接收文件并将其发送到channel中处理
+func GetFile(file chan string, value chan io.Reader, wg *sync.WaitGroup) {
+	for v := range file {
+		//检查内存占用，如果占用过高，需要执行等待，等待内存降低。
+		diff, err := memo.MemDiff()
+		if err != nil {
+			fmt.Println(err)
+		}
+		if diff > 0.2 {
+			time.Sleep(time.Second >> 1) //停止0.5s
+			fmt.Println("Waiting for memory decreasing...")
+		}
+		fi, err := os.Open(v)
+		if err != nil {
+			fmt.Println(err)
+		} else {
+			value <- fi
+		}
+	}
+	wg.Done()
+}
+
+//压缩图片，生成新图片
+func Compress(root string, outputFile string, width int, quality int) {
+	reader := make(chan io.Reader)
+	tmp1 := make(chan *P) //建立接收原图片的临时channel
+	tmp2 := make(chan *P) //建立接收压缩后图片的临时channel
+	//获取文件路径
+	value, err := getFilePath(root)
+	if err != nil {
+		fmt.Println(err)
+	}
+	//接收文件
+	wg0 := new(sync.WaitGroup)
+	wg0.Add(2)
+	for i := 0; i < 2; i++ {
+		mark(i, "Get file path:")
+		go GetFile(value, reader, wg0)
+	}
+	//处理wg0等待，并关闭管道
+	go func() {
+		wg0.Wait()
+		close(reader)
+	}()
+
+	//解析文件名及后缀
+	wg1 := new(sync.WaitGroup)
+	wg1.Add(32) //2的整数次方最好
+	for i := 0; i < 32; i++ {
+		go func(i int) {
+			defer wg1.Done()
+			mark(i, "parsing...")
+			for r := range reader { //遍历reader channel
+				//获取文件名
+				v, ok := r.(*os.File) //把r中的文件所有信息返回给v
+				if !ok {
+					glog.Errorln("It is not a file")
+				}
+				_, fname := filepath.Split(v.Name())
+				//获取文件后缀名
+				name := getSuffix(fname)
+				if name == "" && fname != ".DS_Store" {
+					glog.Errorln("not a file, the file name is ", fname)
+				}
+				//判断图片是否合法
+				img, err := isPicture(name, r)
+				if err != nil {
+					glog.Errorln(err)
+				} else {
+					tmp1 <- &P{
+						img:  img,
+						name: fname,
+					}
+				}
+			}
+		}(i)
+	}
+	//处理wg1等待，并关闭管道
+	go func() {
+		wg1.Wait()
+		close(tmp1)
+	}()
+
+	//压缩图片
+	wg2 := new(sync.WaitGroup)
+	wg2.Add(32) //与wg1对应
+	for i := 0; i < 32; i++ {
+		go func(i int) {
+			defer wg2.Done()
+			mark(i, "compressing...")
+			for i := range tmp1 {
+				i.img = resize.Resize(uint(width), 0, i.img, resize.NearestNeighbor)
+				tmp2 <- i
+			}
+		}(i)
+	}
+
+	//处理wg2等待，并关闭管道
+	go func() {
+		wg2.Wait()
+		close(tmp2)
+	}()
+
+	//创建并输出新文件
+	wg3 := new(sync.WaitGroup)
+	wg3.Add(32)
+	for i := 0; i < 32; i++ {
+		go func(i int) {
+			defer wg3.Done()
+			mark(i, "creating and output...")
+			for i := range tmp2 {
+				defaultname := ""
+				if nameIs == 1 {
+					defaultname = i.name
+				} else {
+					defaultname = genID1() + ".jpeg" //最后生成的文件都是jpeg格式
+				}
+
+				//创建并生成新文件
+				file, err := os.Create(outputFile + "/" + defaultname) //文件路径及文件
+				if err != nil {
+					fmt.Println(err)
+				}
+				defer file.Close() //上一个方法默认会打开文件，因此需要关闭文件
+
+				//返回输出成功的文件名
+				state, err := file.Stat()
+				fmt.Printf("Successfully output the file: %s\n", state.Name())
+
+				//图片压缩质量，需要设置一个默认值
+				if quality < 20 {
+					quality = 20
+				}
+
+				//创建文件时的错误处理
+				if err := jpeg.Encode(file, i.img, &jpeg.Options{quality}); err != nil {
+					glog.Errorln("Create picture wrongly:",err)
+				}
+			}
+		}(i)
+	}
+
+	//建立err管道，并从中取值
+	if er := <-err ; er != nil {
+		fmt.Println("cannot find pictures or no pictures: ", er)
+	}
+
+	wg3.Wait()
+}
 
 //生成图片的唯一id，用于分辨批量处理的各文件
 func genID1() string {
@@ -65,9 +230,8 @@ func genID2() string {
 	return strconv.FormatInt(s.GetID(), 10) //返回10进制的字符串，整数转换为字符串
 }
 
-//获取转换后文件后缀名
-//JPEG格式文件不做处理，过滤
-func getName(name string) string {
+//获取转换后文件后缀名;JPEG格式文件不做处理，过滤
+func getSuffix(name string) string {
 	name = strings.ToLower(name) //将文件名全部转换为小写
 	v1 := name[len(name)-4:]
 	v2 := name[len(name)-3:]
@@ -75,7 +239,49 @@ func getName(name string) string {
 		return v1
 	}
 	if v2 == "jpg" || v2 == "png" || v2 == "gif" {
-		return v1
+		return v2
 	}
 	return ""
+}
+
+//判断文件是否为合法图片类型
+func isPicture(name string, reader io.Reader) (image.Image, error) {
+	switch name {
+	case "jpeg":
+		return jpeg.Decode(reader)
+	case "jpg":
+		return jpeg.Decode(reader) //jpg共用jpeg
+	case "png":
+		return png.Decode(reader)
+	case "gif":
+		return gif.Decode(reader)
+	default:
+		return nil, fmt.Errorf("This tool only supports png, jpg, jpeg, and gif format ")
+	}
+}
+
+func mark(i int, name string) {
+	if i == 0 {
+		fmt.Printf("%s\n", name)
+	}
+}
+
+
+//命令行注释
+func init()  {
+	flag.StringVar(&root,"rt","./image","指定图片所在的路径，可包括子文件夹，本工具会扫描该路径下所有文件夹内的图片") //指定图片所在的路径，默认目录为./image
+	flag.StringVar(&outputPath,"op","./output","指定文件的输出路径")//默认值为./output
+	flag.IntVar(&width,"wd",0,"设置输出图片的宽度")//默认宽度为原图片宽度
+	flag.IntVar(&quality, "qu", 70,"设置输出图片的质量") //默认输出质量为70
+	flag.IntVar(&nameIs, "ni",1,"是否维持原文件名，1为是，0为否")//缺省情况不维护原文件名
+	flag.Parse()
+}
+
+func main() {
+	fmt.Println("欢迎使用tupng图片压缩工具")
+	fmt.Println("-----------------------")
+	Compress(root,outputPath,width, quality)
+	fmt.Println("-----------------------")
+	fmt.Println("压缩完成！")
+	fmt.Printf("打开 %s 压缩后图片\n", outputPath)
 }
